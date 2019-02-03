@@ -1,0 +1,610 @@
+﻿<!DOCTYPE html>
+<html>
+<head>
+    <title>RasPi-NDT</title>
+    <meta charset="utf-8">
+    <style>
+            body {
+                font: 10px sans-serif;
+            }
+
+            .axis path,
+            .axis line {
+                fill: none;
+                stroke: #000;
+                shape-rendering: crispEdges;
+            }
+
+            .x.axis path {
+                display: none;
+            }
+
+            .line {
+                fill: none;
+                stroke: steelblue;
+                stroke-width: 1.5px;
+            }
+
+            .legend {
+                font: 16px sans-serif;
+            }
+
+            div.tooltip {
+                position: absolute;
+                text-align: left;
+                width: 120px;
+                height: 60px;
+                padding: 4px 10px;
+                font: 13px sans-serif;
+                background: lightsteelblue;
+                border: 1px solid black;
+                border-radius: 8px;
+                pointer-events: none;
+            }
+
+            div#sites-path-section {
+                font: 14px sans-serif;
+            }
+
+            div#sites-path-section h2 {
+                font-size: 14px;
+            }
+    </style>
+    <script src="d3.v3.min.js"></script>
+</head>
+<body>
+    <script>
+var margin = {top: 20, right: 20, bottom: 30, left: 50},
+    width = 660 - margin.left - margin.right,
+    height = 500 - margin.top - margin.bottom;
+
+var parseDate = d3.time.format('%Y-%m-%dT%H:%M:%S%Z').parse;
+
+var parseMLabSite = function (hostname) { return hostname.split('.')[3]; };
+
+var color = d3.scale.category10();
+
+var datasets = {};
+
+var selectedDatasets = {};
+
+var yValueDownload = function (d) {
+    return d.downloadThroughput;
+}
+
+var yValueUpload = function (d) {
+    return d.uploadThroughput;
+}
+
+// Define the div for the tooltip
+var div = d3.select('body').append('div')
+    .attr('class', 'tooltip')
+    .style('opacity', 0);
+
+var populateSelectedDatasets = function () {
+    selectedDatasets = {};
+    for (var site in datasets) {
+        if (!(d3.select('#check-' + site)[0][0].checked)) {
+            continue;
+        }
+        selectedDatasets[site] = datasets[site];
+    }
+};
+
+var siteToProvider = function (site) {
+    var providers = {
+        'lga01': 'Internap',
+        'lga02': 'Cogent',
+        'lga03': 'Tata',
+        'lga04': 'GTT',
+        'lga05': 'Level3',
+        'lga06': 'Zayo',
+    }
+    return providers[site];
+};
+
+var drawLegend = function () {
+    d3.keys(datasets).sort().forEach(function (site) {
+        d3.select('#legend').append('label')
+                .text(site + ' (' + siteToProvider(site) + ')')
+                .attr('class', 'legend')
+                .style('color', color(site))
+            .append('input')
+                .attr('type', 'checkbox')
+                .attr('value', site)
+                .attr('id', 'check-' + site)
+                .property('checked', true)
+                .on('change', drawAllDatasets);
+        d3.select('#legend').append('br');
+    });
+};
+
+var drawDailyAverages = function (maxOption) {
+    d3.select('#dailyAverageCount')
+            .on('change', drawAllDatasets);
+    for (var i = 0; i <= maxOption; i++) {
+        d3.select('#dailyAverageCount').append('option')
+            .text(i)
+            .attr((i === 7) ? 'selected' : 'foo', '')
+            .attr('value', i);
+    }
+};
+
+var getTrailingDayCount = function () {
+    return +d3.select('#dailyAverageCount').node().value;
+};
+
+var getHourSliceSize = function () {
+    return +d3.select('#hourlyAverageCount').node().value;
+};
+
+var drawHourlyAverages = function (hourlyOptions) {
+    d3.select('#hourlyAverageCount')
+            .on('change', drawAllDatasets);
+    hourlyOptions.forEach(function (hourlyOption) {
+        d3.select('#hourlyAverageCount').append('option')
+            .text(hourlyOption)
+            .attr((hourlyOption === 2) ? 'selected' : 'foo', '')
+            .attr('value', hourlyOption);
+    });
+};
+
+var createDailyXAxis = function(xScale) {
+    return d3.svg.axis()
+        .scale(xScale)
+        .orient('bottom');
+};
+
+var createHourlyXAxis = function(xScale) {
+    return d3.svg.axis()
+        .scale(xScale)
+        .orient('bottom')
+        .tickFormat(function(d) {
+            dt = new Date();
+            dt.setHours(d);
+            return d3.time.format('%-I %p')(dt)
+        });
+};
+
+var drawAxes = function (svg, xAxis, xScale, yScale) {
+    svg.append('g')
+        .attr('class', 'x axis')
+        .attr('transform', 'translate(0,' + height + ')')
+        .call(xAxis);
+
+    var yAxis = d3.svg.axis()
+        .scale(yScale)
+        .orient('left');
+
+    svg.append('g')
+        .attr('class', 'y axis')
+        .call(yAxis)
+      .append('text')
+        .attr('transform', 'rotate(-90)')
+        .attr('y', -45)
+        .attr('dy', '.71em')
+        .style('text-anchor', 'end')
+        .text('Throughput (Mbps)');
+}
+
+function daysBetween(date1, date2) {
+    var ONE_DAY = 1000 * 60 * 60 * 24;
+
+    var date1InMs = date1.getTime();
+    var date2InMs = date2.getTime();
+    var differenceInMs = Math.abs(date1InMs - date2InMs);
+    var differenceDays = Math.floor(differenceInMs / ONE_DAY);
+    return differenceDays;
+}
+
+var mapper = function (dataset, getKeys) {
+    var map = {};
+    dataset.forEach(function (d) {
+        getKeys(d).forEach(function (key) {
+            if (key in map) {
+                map[key].push(d);
+            } else {
+                map[key] = [d];
+            }
+        });
+    });
+    return map;
+};
+
+var identityMapper = function (dataset) {
+    return mapper(dataset, function (d) {
+        return [d.date];
+    });
+}
+
+var dailyMapper = function (dataset) {
+    var daysToGoBack = (+d3.select('#dailyAverageCount').node().value) - 1;
+    return mapper(dataset, function (d) {
+        if (daysToGoBack === -1) {
+            return [d.date];
+        }
+        var keys = [];
+        for (var i = 0; i <= daysToGoBack; i++) {
+            var dt = new Date(d.date.getFullYear(), d.date.getMonth(), d.date.getDate() - i);
+            // HACK: Hardcoding 3/22/2015 because that's when collection starts for
+            // my dataset.
+            var minDate = new Date(2015, 2, 22);
+            var maxDate = new Date();
+            maxDate.setDate(maxDate.getDate() - daysToGoBack);
+            if (dt >= minDate && dt < maxDate) {
+                keys.push(dt);
+            }
+        }
+        return keys;
+    });
+};
+
+var hourlyMapper = function (dataset) {
+    var hourSliceSize = getHourSliceSize();
+    return mapper(dataset, function (d) {
+        var hourRaw = d.date.getHours();
+        var hourRounded = hourRaw - (hourRaw % hourSliceSize);
+        return [hourRounded];
+    });
+};
+
+var reducer = function (mapped_dataset, aggregator) {
+    var aggregates = [];
+    for (var timeWindow in mapped_dataset) {
+        aggregateDownload = aggregator(mapped_dataset[timeWindow], function (d) {
+            return d.download_throughput;
+        });
+        aggregateUpload = aggregator(mapped_dataset[timeWindow], function (d) {
+            return d.upload_throughput;
+        });
+        var time = timeWindow;
+        if (time.length > 5) { //hack workaround
+            time = new Date(time);
+        } else {
+            time = parseInt(time);
+        }
+        aggregates.push({
+            site: mapped_dataset[timeWindow][0].site,
+            time: time,
+            downloadThroughput: aggregateDownload,
+            uploadThroughput: aggregateUpload,
+            count: mapped_dataset[timeWindow].length
+        });
+    }
+    return aggregates;
+};
+
+var mean = function (values, getValue) {
+    var total = 0;
+    var n = 0;
+    values.forEach(function (d) {
+        total += getValue(d);
+        n++;
+    });
+    return total / n;
+};
+
+var meanReducer = function (mappedDataset) {
+    return reducer(mappedDataset, mean);
+};
+
+var calculateAggregate = function (dataset, mapper, reducer) {
+    mappedDataset = mapper(dataset);
+    return reducer(mappedDataset);
+};
+var hourToTimeString = function (hour) {
+    var timeString = d3.time.format('%I %p')(new Date(2000, 0, 1, hour));
+    if (timeString[0] === '0') {
+        timeString = timeString.substr(1);
+    }
+    return timeString;
+}
+
+var formatTimeForTooltipByDay = function (time) {
+    var trailingDays = getTrailingDayCount();
+    if (trailingDays === 0) {
+        return d3.time.format('%B %e %-I:%M %p')(time);
+    } else if (trailingDays === 1) {
+        return d3.time.format('%B %e')(time);
+    } else {
+        var rangeStart = time;
+        var rangeEnd = new Date(time.getFullYear(), time.getMonth(), time.getDate() + trailingDays - 1);
+
+        return d3.time.format('%B %e')(rangeStart) + ' - ' + d3.time.format('%B %e')(rangeEnd);
+    }
+};
+
+var formatTimeForTooltipByHourOfDay = function (hourOfDay) {
+    var hourSliceSize = getHourSliceSize();
+    return hourToTimeString(hourOfDay) + ' - ' + hourToTimeString(hourOfDay + hourSliceSize) + ' EST';
+};
+
+var drawDataLines = function (graphId, mapper, reducer, xAxis, xScale, yScale, yValue, formatTimeForTooltip) {
+    var line = d3.svg.line()
+        .x(function (d) { return xScale(d.time); })
+        .y(function (d) { return yScale(yValue(d)); });
+
+    var aggregates = {};
+    for (var site in selectedDatasets) {
+        aggregates[site] = calculateAggregate(selectedDatasets[site], mapper, reducer);
+        aggregates[site].sort(function (a, b) { return a.time - b.time; });
+    }
+
+    // TODO: There's almost certainly a better way of finding the domain of
+    //  a set of keys and values in D3 but I don't know what it is.
+    var allKeys = [];
+    var allValues = [];
+    for (site in aggregates) {
+        aggregates[site].forEach(function (d) {
+            allKeys.push(d.time);
+            allValues.push(yValue(d));
+        });
+    }
+    xScale.domain(d3.extent(allKeys));
+    yScale.domain([0, d3.max(allValues)]);
+
+    var outerSvg = d3.select(graphId)
+        .attr('width', width + margin.left + margin.right)
+        .attr('height', height + margin.top + margin.bottom);
+    outerSvg.selectAll('*').remove();
+    var svg = outerSvg.append('g')
+        .attr('transform', 'translate(' + margin.left + ',' + margin.top + ')');
+
+    drawAxes(svg, xAxis, xScale, yScale);
+
+    for (var site in aggregates) {
+        svg.append('path')
+            .datum(aggregates[site])
+            .attr('class', 'line')
+            .attr('d', line)
+            .style('stroke', color(site));
+
+        svg.selectAll('dot')
+            .data(aggregates[site])
+          .enter().append('circle')
+            .attr('r', 3.0)
+            .attr('cx', function (d) { return xScale(d.time); })
+            .attr('cy', function (d) { return yScale(yValue(d)); })
+            .style('fill', color(site))
+            .on('mouseover', function(d) {
+                div.transition()
+                    .duration(200)
+                    .style('opacity', .9);
+                div.html(siteToProvider(d.site) + '<br/>' + formatTimeForTooltip(d.time) + '<br/>' + yValue(d).toFixed(2) + ' Mbps<br/>' + d.count + ' samples')
+                    .style('left', (d3.event.pageX + 15) + 'px')
+                    .style('top', (d3.event.pageY - 28) + 'px');
+            })
+            .on('mouseout', function(d) {
+                div.transition()
+                    .duration(500)
+                    .style('opacity', 0);
+            });
+    }
+};
+
+var drawDailyGraphs = function () {
+    console.log('Drawing daily aggregate');
+
+    var yScale = d3.scale.linear()
+      .range([height, 0]);
+
+    var xScale = d3.time.scale()
+        .range([0, width]);
+
+    drawDataLines(
+            '#downloadDailyAggregate',
+            dailyMapper,
+            meanReducer,
+            createDailyXAxis(xScale),
+            xScale,
+            yScale,
+            yValueDownload,
+            formatTimeForTooltipByDay);
+    drawDataLines(
+            '#uploadDailyAggregate',
+            dailyMapper,
+            meanReducer,
+            createDailyXAxis(xScale),
+            xScale, yScale, yValueUpload, formatTimeForTooltipByDay);
+};
+
+var drawHourlyGraphs = function () {
+    console.log('Drawing hourly aggregate');
+
+    var yScale = d3.scale.linear()
+      .range([height, 0]);
+
+    var xScale = d3.scale.linear()
+        .range([0, width]);
+
+    drawDataLines(
+            '#downloadHourlyAggregate',
+            hourlyMapper,
+            meanReducer,
+            createHourlyXAxis(xScale),
+            xScale,
+            yScale,
+            yValueDownload,
+            formatTimeForTooltipByHourOfDay);
+    drawDataLines(
+            '#uploadHourlyAggregate',
+            hourlyMapper,
+            meanReducer,
+            createHourlyXAxis(xScale),
+            xScale,
+            yScale,
+            yValueUpload,
+            formatTimeForTooltipByHourOfDay);
+}
+
+var drawAllDatasets = function () {
+    populateSelectedDatasets();
+
+    drawDailyGraphs();
+    drawHourlyGraphs();
+};
+
+var parseHeaderlessCsv = function(csvText) {
+    return d3.csv.parseRows(csvText).map(function(row) {
+        return row.map(function(value) {
+            return value;
+        });
+    });
+};
+
+
+var alexaPaths = [];
+var mlabPaths = {};
+
+var loadAlexaPaths = function() {
+    d3.text('data/alexa-pt-paths.csv', function(text) {
+        var data = parseHeaderlessCsv(text)
+        data.forEach(function(d, rank) {
+            alexaPaths.push({
+                url: d[0],
+                path: d.slice(1),
+                rank: rank
+            });
+        });
+        loadMLabPaths();
+    });
+};
+
+var formatASPath = function(asPath) {
+    var asPathTranslated = [];
+    asPath.forEach(function(asn) {
+        if (asn) {
+            asPathTranslated.push(asn);
+        } else {
+            asPathTranslated.push('ASN Unknown');
+        }
+    });
+    return asPathTranslated.join(', ');
+};
+
+var loadMLabPaths = function() {
+    d3.text('data/mlab-pt-paths.csv', function(text) {
+        var data = parseHeaderlessCsv(text)
+        var mlabSites = {};
+        data.forEach(function(d) {
+            site = parseMLabSite(d[0]);
+            mlabPaths[site] = d.slice(1);
+            });
+        populatePathInfo();
+    });
+};
+
+var isPathPrefix = function(prefix, path) {
+    var isPrefix = true;
+    prefix.forEach(function(d, i) {
+        if (path[i] != d) {
+            isPrefix = false;
+            return;
+        }
+    });
+    return isPrefix;
+}
+
+var populatePathInfo = function() {
+    var alexaByMLabSite = {}
+    for (var mlabSite in mlabPaths) {
+        alexaByMLabSite[mlabSite] = []
+    }
+    alexaPaths.forEach(function(d) {
+        for (var mlabSite in mlabPaths) {
+            if (isPathPrefix(mlabPaths[mlabSite], d.path)) {
+                alexaByMLabSite[mlabSite].push(d);
+            }
+
+        }
+    });
+    for (var mlabSite in alexaByMLabSite) {
+            var siteDiv = d3.select('#sites-path-section')
+            .append('div')
+                    .style('color', color(mlabSite));
+        siteDiv.append('h2')
+            .text(mlabSite + ' (' + siteToProvider(mlabSite) + '): '
+                    + formatASPath(mlabPaths[mlabSite]))
+                    .style('color', color(mlabSite));
+        var siteList = siteDiv.append('ul');
+        alexaByMLabSite[mlabSite].forEach(function(d) {
+            siteList.append('li')
+                .html('#' + d.rank + ' - ' + d.url + ': ' + formatASPath(d.path));
+        });
+        if (alexaByMLabSite[mlabSite].length === 0) {
+            siteList.append('li')
+                .text('No sites share a path with this transit provider.');
+        }
+    }
+}
+
+d3.csv("data/ndt-history.csv", function (error, data) {
+  data.forEach(function (d) {
+    var site = parseMLabSite(d.ndt_server);
+    if (!(site in datasets)) {
+        datasets[site] = []
+    }
+    datasets[site].push({
+        site: site,
+        date: parseDate(d.date),
+        download_throughput: +d.download_throughput,
+        upload_throughput: +d.upload_throughput
+    });
+  });
+
+  color.domain(d3.keys(datasets));
+
+  drawLegend();
+  drawDailyAverages(15);
+  drawHourlyAverages([1, 2, 3, 4, 6]);
+  drawAllDatasets();
+});
+
+loadAlexaPaths();
+
+
+    </script>
+    <div id="legend">
+
+    </div>
+    <div>
+        <h1>Throughput by Day</h1>
+        <p>Trailing average of <select id="dailyAverageCount"></select> days</p>
+        <table>
+            <tr>
+                <td>
+                    <h2>Download</h2>
+                    <svg id="downloadDailyAggregate" />
+                </td>
+                <td>
+                    <h2>Upload</h2>
+                    <svg id="uploadDailyAggregate" />
+                </td>
+            </tr>
+        </table>
+    </div>
+    <div>
+        <h1>Throughput by Hour of Day</h1>
+        <p>Bins of <select id="hourlyAverageCount"></select> hours</p>
+        <table>
+            <tr>
+                <td>
+                    <h1>Download</h1>
+                    <svg id="downloadHourlyAggregate" />
+                </td>
+                <td>
+                    <h1>Upload</h1>
+                    <svg id="uploadHourlyAggregate" />
+                </td>
+            </tr>
+        </table>
+    </div>
+    <div>
+        <h1>Alexa Top Sites by AS Path</h1>
+        <h3 style="color:red">Warning: These sites come from the Alexa top global sites and include adult URLs</h3>
+        <p>What sites are behind these transit providers from your vantage point on the Internet?</p>
+        <div id="sites-path-section"></div>
+    </div>
+
+</body>
+</html>
